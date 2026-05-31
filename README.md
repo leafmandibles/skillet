@@ -1,5 +1,7 @@
 # skillet
 
+![Skillet logo](docs/images/logo.png)
+
 A small test harness for developing and testing local `agent` skills using pi-agent as a test runner.
 
 ## Getting Started
