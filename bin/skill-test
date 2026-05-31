@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import datetime as dt
+import json
+import shlex
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+TEST_DIRS = ("fixtures", "prompts")
+
+
+@dataclass(frozen=True)
+class ObservedEvent:
+    event: dict[str, Any]
+    observed_at: float
+    observed_timestamp: str
+
+
+@dataclass(frozen=True)
+class PiRun:
+    returncode: int
+    stdout: str
+    stderr: str
+    events: tuple[ObservedEvent, ...]
+
+
+def usage() -> str:
+    return """usage:
+  skill-test init <namespace>
+  skill-test [-o yaml] <namespace> <relative-prompt-path|ad hoc prompt>
+
+examples:
+  skill-test init randomtests
+  skill-test randomtests prompts/chat_capture_test.txt
+  skill-test -o yaml randomtests prompts/chat_capture_test.txt
+  skill-test randomtests "capture this chat note"
+
+behavior:
+  pi runs with cwd set to test/<namespace>
+
+output:
+  default   runs pi in JSON mode and prints a concise session summary
+  -o yaml   runs pi in JSON mode and prints a YAML wrapper after pi exits"""
+
+
+def git_root() -> Path:
+    result = subprocess.run(["git", "rev-parse", "--show-toplevel"], check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        return Path.cwd()
+    return Path(result.stdout.strip())
+
+
+def ensure_dirs(root: Path, namespace: str) -> None:
+    ns_root = namespace_root(root, namespace)
+    for rel_path in TEST_DIRS:
+        (ns_root / rel_path).mkdir(parents=True, exist_ok=True)
+    agents_root = ns_root / ".agents"
+    agents_root.mkdir(parents=True, exist_ok=True)
+    skills_link = agents_root / "skills"
+    target = root / "skill"
+    if not skills_link.exists():
+        skills_link.symlink_to(target, target_is_directory=True)
+
+
+def test_root(root: Path) -> Path:
+    candidate = root / "test"
+    if candidate.exists() and not candidate.is_dir():
+        return root / "test-runs"
+    return candidate
+
+
+def namespace_root(root: Path, namespace: str) -> Path:
+    return test_root(root) / namespace
+
+
+def prompt_path(root: Path, namespace: str, value: str) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return namespace_root(root, namespace) / path
+
+
+def read_prompt(root: Path, namespace: str, value: str) -> tuple[str, Path | None]:
+    path = prompt_path(root, namespace, value)
+    if path.exists() and path.is_file():
+        return path.read_text(encoding="utf-8").strip(), path
+    return value.strip(), None
+
+
+def parse_json_event(line: str) -> dict[str, Any] | None:
+    try:
+        value = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(value, dict) and isinstance(value.get("type"), str):
+        return value
+    return None
+
+
+def run_pi(prompt: str, cwd: Path) -> PiRun:
+    command = ["pi", "--mode", "json", "-p", prompt]
+    print("running: " + shlex.join(command), file=sys.stderr)
+    print(f"cwd: {cwd}", file=sys.stderr)
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout_lines: list[str] = []
+    observed_events: list[ObservedEvent] = []
+    assert process.stdout is not None
+    for line in process.stdout:
+        observed_at = time.monotonic()
+        observed_timestamp = timestamp_from_epoch(time.time())
+        stdout_lines.append(line)
+        event = parse_json_event(line)
+        if event is not None:
+            observed_events.append(ObservedEvent(event=event, observed_at=observed_at, observed_timestamp=observed_timestamp))
+    stderr = process.stderr.read() if process.stderr is not None else ""
+    returncode = process.wait()
+    return PiRun(
+        returncode=returncode,
+        stdout="".join(stdout_lines),
+        stderr=stderr,
+        events=tuple(observed_events),
+    )
+
+
+def handle_init(root: Path, namespace: str) -> int:
+    ensure_dirs(root, namespace)
+    print(f"created {display_path(root, namespace_root(root, namespace))}/fixtures and prompts")
+    return 0
+
+
+def timestamp() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def timestamp_from_epoch(value: float) -> str:
+    return dt.datetime.fromtimestamp(value, dt.timezone.utc).isoformat()
+
+
+def yaml_scalar(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = str(value)
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def yaml_block(value: str, indent: str) -> list[str]:
+    if not value:
+        return [f"{indent}|"]
+    return [f"{indent}|"] + [f"{indent}  {line}" for line in value.splitlines()]
+
+
+def display_path(root: Path, path: Path) -> str:
+    try:
+        rel_path = path.relative_to(root)
+        return f"./{rel_path.as_posix()}"
+    except ValueError:
+        return path.as_posix()
+
+
+def message_text(message: dict[str, Any]) -> str:
+    content = message.get("content", [])
+    if not isinstance(content, list):
+        return ""
+    parts = [item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"]
+    return "".join(parts)
+
+
+def elapsed_seconds(start: float | None, end: float | None) -> float | None:
+    if start is None or end is None:
+        return None
+    return round(max(0.0, end - start), 3)
+
+
+def session_items(events: tuple[ObservedEvent, ...]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    message_starts: dict[str, ObservedEvent] = {}
+    for observed in events:
+        event = observed.event
+        event_type = event.get("type")
+        if event_type == "message_start":
+            message = event.get("message", {})
+            if isinstance(message, dict):
+                role = str(message.get("role", "message"))
+                message_starts[role] = observed
+        elif event_type == "message_end":
+            message = event.get("message", {})
+            if isinstance(message, dict):
+                role = str(message.get("role", "message"))
+                start = message_starts.get(role)
+                items.append({
+                    "type": "message",
+                    "role": role,
+                    "start": start.observed_timestamp if start else observed.observed_timestamp,
+                    "end": observed.observed_timestamp,
+                    "elapsed": elapsed_seconds(start.observed_at if start else observed.observed_at, observed.observed_at),
+                    "content": message_text(message),
+                })
+        elif event_type == "tool_execution_start":
+            items.append({
+                "type": "tool_call",
+                "role": "tool",
+                "start": observed.observed_timestamp,
+                "end": None,
+                "elapsed": None,
+                "content": f"{event.get('toolName', '')} {json.dumps(event.get('args', {}), ensure_ascii=False)}",
+                "toolCallId": event.get("toolCallId"),
+            })
+        elif event_type == "tool_execution_end":
+            items.append({
+                "type": "tool_result",
+                "role": "tool",
+                "start": None,
+                "end": observed.observed_timestamp,
+                "elapsed": None,
+                "content": json.dumps(event.get("result", ""), ensure_ascii=False),
+                "toolCallId": event.get("toolCallId"),
+                "isError": event.get("isError"),
+            })
+    return items
+
+
+def final_output(events: tuple[ObservedEvent, ...]) -> str:
+    for observed in reversed(events):
+        event = observed.event
+        if event.get("type") == "turn_end":
+            message = event.get("message", {})
+            if isinstance(message, dict):
+                return message_text(message)
+    for item in reversed(session_items(events)):
+        if item.get("type") == "message" and item.get("role") == "assistant":
+            return str(item.get("content", ""))
+    return ""
+
+
+def format_console(run: PiRun) -> str:
+    lines = ["session:"]
+    for item in session_items(run.events):
+        elapsed = item.get("elapsed")
+        elapsed_text = "?" if elapsed is None else f"{elapsed}s"
+        content = str(item.get("content", "")).strip()
+        lines.append(f"- {item.get('role')} {item.get('type')} ({elapsed_text})")
+        if content:
+            lines.append(f"  {content}")
+    if run.stderr.strip():
+        lines.extend(["stderr:", run.stderr.strip()])
+    return "\n".join(lines)
+
+
+def format_yaml_list(items: list[dict[str, Any]], indent: str) -> list[str]:
+    lines: list[str] = []
+    for item in items:
+        lines.append(f"{indent}- type: {yaml_scalar(item.get('type'))}")
+        for key in ("role", "start", "end", "elapsed", "toolCallId", "isError"):
+            if key in item:
+                lines.append(f"{indent}  {key}: {yaml_scalar(item.get(key))}")
+        lines.append(f"{indent}  content:")
+        lines.extend(yaml_block(str(item.get("content", "")), indent + "    "))
+    return lines
+
+
+def format_output(
+    namespace: str,
+    input_value: str,
+    input_path: Path | None,
+    root: Path,
+    run: PiRun,
+) -> str:
+    lines = ["input:"]
+    lines.append(f"  timestamp: {yaml_scalar(timestamp())}")
+    lines.append(f"  namespace: {yaml_scalar(namespace)}")
+    if input_path is None:
+        lines.append(f"  prompt: {yaml_scalar(input_value)}")
+    else:
+        lines.append(f"  file: {yaml_scalar(display_path(root, input_path))}")
+    lines.extend(["", "session:"])
+    lines.extend(format_yaml_list(session_items(run.events), "  "))
+    output_data = final_output(run.events)
+    if run.stderr:
+        output_data = f"{output_data}\n[stderr]\n{run.stderr}".strip()
+    lines.extend(["", "output:", "  content-type: text/plain", "  data:"])
+    lines.extend(yaml_block(output_data, "    "))
+    return "\n".join(lines)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        print(usage(), file=sys.stderr)
+        return 2
+
+    root = git_root()
+    if argv[1] == "init":
+        if len(argv) != 3:
+            print(usage(), file=sys.stderr)
+            return 2
+        return handle_init(root, argv[2])
+
+    if len(argv) < 3:
+        print(usage(), file=sys.stderr)
+        return 2
+
+    output_format = "console"
+    args = argv[1:]
+    if args[:2] == ["-o", "yaml"]:
+        output_format = "yaml"
+        args = args[2:]
+    elif args[:1] == ["-o"]:
+        print(usage(), file=sys.stderr)
+        return 2
+
+    if len(args) < 2:
+        print(usage(), file=sys.stderr)
+        return 2
+
+    namespace = args[0]
+    command_or_prompt = " ".join(args[1:])
+    prompt, source_path = read_prompt(root, namespace, command_or_prompt)
+    if not prompt:
+        print("empty prompt", file=sys.stderr)
+        return 2
+
+    ensure_dirs(root, namespace)
+    run = run_pi(prompt, namespace_root(root, namespace))
+    if output_format == "yaml":
+        print(format_output(namespace, command_or_prompt, source_path, root, run))
+    else:
+        print(format_console(run))
+    return run.returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
